@@ -912,12 +912,13 @@
           // Slash command: "/pomo [minutes] [task]" + Enter starts a timer; "/pomo stop" cancels it.
           var pomoKey = "free_text_pomo_v1";
           var pomo = { timer: null, log: [] };
+          var tags = [];
           var pomoNode = null;
           var pomoTick = 0;
 
           function pomoSave() {
             try {
-              localStorage.setItem(pomoKey, JSON.stringify({ timer: pomo.timer, log: pomo.log }));
+              localStorage.setItem(pomoKey, JSON.stringify({ timer: pomo.timer, log: pomo.log, tags: tags }));
             } catch (e) {}
           }
 
@@ -926,7 +927,10 @@
               var saved = JSON.parse(localStorage.getItem(pomoKey) || "{}");
 
               pomo.timer = saved.timer || null;
-              pomo.log = Array.isArray(saved.log) ? saved.log : [];
+              pomo.log = (Array.isArray(saved.log) ? saved.log : []).map(function (e) {
+                return typeof e === "number" ? { t: e, task: "", min: 25, ok: true, x: 0, y: 0 } : e;
+              });
+              tags = Array.isArray(saved.tags) ? saved.tags : [];
             } catch (e) {}
           }
 
@@ -935,7 +939,7 @@
 
             start.setHours(0, 0, 0, 0);
 
-            return pomo.log.filter(function (t) { return t >= start.getTime(); }).length;
+            return pomo.log.filter(function (e) { return e.ok && e.t >= start.getTime(); }).length;
           }
 
           function writeAt(x, y, text) {
@@ -996,8 +1000,9 @@
             setCell(t.x, t.y, ok ? "\u2705" : "\u23F9");
             pomo.timer = null;
 
+            pomo.log.push({ t: Date.now(), task: t.task, min: t.min, ok: ok, x: t.x, y: t.y });
+
             if (ok) {
-              pomo.log.push(Date.now());
               pomoBeep();
             }
 
@@ -1016,11 +1021,62 @@
             }, 1000);
           }
 
-          // Returns true if the row held a /pomo command (rewritten in place).
-          function runPomoCommand(y) {
+          // Group of notes around (x, y): cells within 4 columns / 1 row of each other.
+          function clusterAround(x, y) {
+            var seen = {};
+            var queue = [[x, y]];
+            var box = null;
+            var dx;
+            var dy;
+
+            while (queue.length) {
+              var cur = queue.pop();
+              var k = mapKey(cur[0], cur[1]);
+
+              if (seen[k] || !cellMap.has(k)) {
+                continue;
+              }
+
+              seen[k] = true;
+              box = box
+                ? { x0: Math.min(box.x0, cur[0]), y0: Math.min(box.y0, cur[1]), x1: Math.max(box.x1, cur[0]), y1: Math.max(box.y1, cur[1]) }
+                : { x0: cur[0], y0: cur[1], x1: cur[0], y1: cur[1] };
+
+              for (dy = -1; dy <= 1; dy += 1) {
+                for (dx = -4; dx <= 4; dx += 1) {
+                  if (!seen[mapKey(cur[0] + dx, cur[1] + dy)]) {
+                    queue.push([cur[0] + dx, cur[1] + dy]);
+                  }
+                }
+              }
+            }
+
+            return box;
+          }
+
+          function jumpTo(x, y) {
+            cursorX = x;
+            cursorY = y;
+            cursorActive = true;
+            offsetX = x * cellWidth - canvas.clientWidth / 2 + 120;
+            offsetY = y * cellHeight - canvas.clientHeight / 2;
+          }
+
+          function rowText(y, x0, x1) {
+            var t = "";
+            var x;
+
+            for (x = x0; x <= x1; x += 1) {
+              t += cellAt(x, y);
+            }
+
+            return t;
+          }
+
+          // "/pomo ...", "/tag ..." typed on a line: rewrite it in place. Returns true if handled.
+          function runCommand(y) {
             var left = null;
             var right = null;
-            var text = "";
             var m;
             var x;
 
@@ -1040,24 +1096,66 @@
               return false;
             }
 
-            for (x = left; x <= right; x += 1) {
-              text += cellAt(x, y);
-            }
+            var text = rowText(y, left, right);
 
-            m = /(^|\s)\/pomo(?:\s+(.*))?$/.exec(text);
+            m = /(^|\s)\/(pomo|tag)(?:\s+(.*))?$/.exec(text);
 
             if (!m) {
               return false;
             }
 
             var slashX = left + m.index + m[1].length;
-            var arg = (m[2] || "").trim();
-            var minutes = 25;
-            var num = /^(\d{1,3})(?:\s+|$)/.exec(arg);
+            var arg = (m[3] || "").trim();
 
             for (x = slashX; x <= right + 1; x += 1) {
               setCell(x, y, "");
             }
+
+            if (m[2] === "tag") {
+              var name = arg.replace(/^#/, "").replace(/\s+/g, "_");
+
+              if (!name) {
+                openFinder(
+                  tags.map(function (g) {
+                    return { label: "#" + g.name, hint: rowText(g.y0, g.x0, g.x0 + 40).trim(), x: g.x0, y: g.y0 };
+                  }),
+                  "tags"
+                );
+                return true;
+              }
+
+              writeAt(slashX, y, "#" + name);
+
+              var box = clusterAround(slashX, y);
+
+              if (box) {
+                box.name = name;
+                tags.push(box);
+                pomoSave();
+              }
+
+              return true;
+            }
+
+            if (arg === "list") {
+              openFinder(
+                pomo.log.slice().reverse().map(function (e) {
+                  var d = new Date(e.t);
+
+                  return {
+                    label: (e.ok ? "\u2705 " : "\u23F9 ") + (e.task || "pomodoro"),
+                    hint: e.min + "m " + dateLabel(d) + " " + timeLabel(d),
+                    x: e.x,
+                    y: e.y,
+                  };
+                }),
+                "sessions"
+              );
+              return true;
+            }
+
+            var minutes = 25;
+            var num = /^(\d{1,3})(?:\s+|$)/.exec(arg);
 
             if (arg === "stop") {
               pomoFinish(false);
@@ -1070,13 +1168,157 @@
             }
 
             pomoFinish(false);
-            pomo.timer = { end: Date.now() + minutes * 60000, task: arg, x: slashX, y: y };
+            pomo.timer = { end: Date.now() + minutes * 60000, min: minutes, task: arg, x: slashX, y: y };
             writeAt(slashX, y, "\u{1F345} " + arg);
             pomoSave();
             pomoLoop();
             pomoRender();
 
             return true;
+          }
+
+          // Rofi-style finder: Cmd/Ctrl+K searches all text; also used for /tag and /pomo list.
+          var finder = { node: null, input: null, list: null, items: [], shown: [], sel: 0 };
+
+          function closeFinder() {
+            if (finder.node) {
+              finder.node.style.display = "none";
+            }
+
+            canvas.focus();
+          }
+
+          function finderRender() {
+            var q = finder.input.value.toLowerCase().trim();
+
+            finder.shown = finder.items
+              .filter(function (it) { return !q || (it.label + " " + it.hint).toLowerCase().indexOf(q) !== -1; })
+              .slice(0, 8);
+            finder.sel = Math.min(finder.sel, Math.max(0, finder.shown.length - 1));
+            finder.list.innerHTML = "";
+            finder.shown.forEach(function (it, i) {
+              var row = document.createElement("div");
+              var label = it.label.length > 60 ? it.label.slice(0, 59) + "\u2026" : it.label;
+
+              row.textContent = label + (it.hint ? "   " + it.hint : "");
+              row.style.cssText =
+                "padding:2px 12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
+                (i === finder.sel ? "background:#ffff00;" : "");
+              row.addEventListener("pointerdown", function (e) {
+                e.preventDefault();
+                finder.sel = i;
+                finderPick();
+              });
+              finder.list.appendChild(row);
+            });
+
+            if (finder.shown.length === 0) {
+              finder.list.textContent = "nothing found";
+              finder.list.style.color = "#888";
+            } else {
+              finder.list.style.color = "#000";
+            }
+          }
+
+          function finderPick() {
+            var it = finder.shown[finder.sel];
+
+            closeFinder();
+
+            if (it) {
+              jumpTo(it.x, it.y);
+            }
+          }
+
+          function openFinder(items, mode) {
+            if (!finder.node) {
+              finder.node = document.createElement("div");
+              finder.input = document.createElement("input");
+              finder.list = document.createElement("div");
+              finder.node.style.cssText =
+                "position:fixed;top:18%;left:50%;transform:translateX(-50%);width:min(560px,90vw);z-index:70;" +
+                "background:#fff;border:1px solid #000;font:14px/1.6 monospace;";
+              finder.input.style.cssText =
+                "width:100%;box-sizing:border-box;border:0;border-bottom:1px solid #000;outline:0;" +
+                "padding:6px 12px;font:inherit;background:#fff;color:#000;";
+              finder.input.setAttribute("spellcheck", "false");
+              finder.input.addEventListener("input", function () {
+                finder.sel = 0;
+                finderRender();
+              });
+              finder.input.addEventListener("keydown", function (e) {
+                e.stopPropagation();
+
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  closeFinder();
+                } else if (e.key === "Enter") {
+                  e.preventDefault();
+                  finderPick();
+                } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  finder.sel = (finder.sel + (e.key === "ArrowDown" ? 1 : finder.shown.length - 1)) % Math.max(1, finder.shown.length);
+                  finderRender();
+                }
+              });
+              finder.node.appendChild(finder.input);
+              finder.node.appendChild(finder.list);
+              document.body.appendChild(finder.node);
+            }
+
+            finder.items = items;
+            finder.sel = 0;
+            finder.input.value = "";
+            finder.input.placeholder = mode === "search" ? "search" : mode;
+            finder.node.style.display = "block";
+            finderRender();
+            finder.input.focus();
+          }
+
+          function searchItems() {
+            var rows = {};
+            var items = tags.map(function (g) {
+              return { label: "#" + g.name, hint: "tag", x: g.x0, y: g.y0 };
+            });
+
+            cellMap.forEach(function (value, key) {
+              var comma = key.indexOf(",");
+              var wy = parseInt(key.slice(comma + 1), 10);
+
+              (rows[wy] = rows[wy] || []).push([parseInt(key, 10), value]);
+            });
+
+            Object.keys(rows).sort(function (a, b) { return a - b; }).forEach(function (rowKey) {
+              var cells = rows[rowKey].sort(function (a, b) { return a[0] - b[0]; });
+              var text = "";
+              var start = null;
+              var last = null;
+
+              function flush() {
+                if (text.trim()) {
+                  items.push({ label: text.trim(), hint: "", x: start, y: parseInt(rowKey, 10) });
+                }
+
+                text = "";
+                start = null;
+              }
+
+              cells.forEach(function (c) {
+                if (last !== null && c[0] - last > 3) {
+                  flush();
+                }
+
+                if (start === null) {
+                  start = c[0];
+                }
+
+                text += (last !== null && c[0] - last > 1 && text ? " " : "") + c[1];
+                last = c[0];
+              });
+              flush();
+            });
+
+            return items;
           }
 
           // Emoji picker: typing ":" opens it; keep typing to filter.
@@ -1533,7 +1775,7 @@
 
             if (event.key === "Enter") {
               event.preventDefault();
-              runPomoCommand(cursorY);
+              runCommand(cursorY);
               cursorX = guestbookStartPoint.x;
               cursorY += 1;
               hidePicker();
@@ -1689,6 +1931,25 @@
               }
             });
 
+            tags.forEach(function (g) {
+              ctx.fillStyle = "#e4e4e4";
+              ctx.fillRect(g.x0 * cellWidth - offsetX - 5, g.y0 * cellHeight - offsetY, 2, (g.y1 - g.y0 + 1) * cellHeight);
+            });
+
+            if (pomo.timer && rows[pomo.timer.y]) {
+              var endX = 0;
+              var left = Math.max(0, Math.round((pomo.timer.end - now) / 1000));
+
+              rows[pomo.timer.y].forEach(function (c) { endX = Math.max(endX, c[0]); });
+              ctx.fillStyle = "#888888";
+              ctx.font = "16px monospace";
+              ctx.fillText(
+                Math.floor(left / 60) + ":" + (left % 60 < 10 ? "0" : "") + (left % 60),
+                (endX + 2) * cellWidth - offsetX,
+                pomo.timer.y * cellHeight - offsetY + baseline
+              );
+            }
+
             ctx.fillStyle = "#000000";
             ctx.font = "16px monospace";
 
@@ -1758,6 +2019,12 @@
           loadImages();
 
           window.addEventListener("paste", onPaste);
+          window.addEventListener("keydown", function (e) {
+            if (guestbookApp && guestbookApp.active && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+              e.preventDefault();
+              openFinder(searchItems(), "search");
+            }
+          });
           canvas.addEventListener("wheel", onWheel, { passive: false });
           canvas.addEventListener("pointerdown", onPointerDown);
           window.addEventListener("pointermove", onPointerMove);
