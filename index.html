@@ -284,6 +284,8 @@
           var remoteMinWriteIntervalMs = 12000;
           var remotePollIntervalMs = 7000;
           var cellMap = new Map();
+          var images = [];
+          var imagesKey = "free_text_images_v1";
           var versionMap = new Map();
           var cellCountNode = null;
           var syncStatusNode = null;
@@ -858,6 +860,86 @@
             };
           }
 
+          // Pasted images: downscaled, kept in localStorage, drawn at their cell.
+          function saveImages() {
+            try {
+              localStorage.setItem(
+                imagesKey,
+                JSON.stringify(images.map(function (it) { return { x: it.x, y: it.y, src: it.src }; }))
+              );
+            } catch (e) {}
+          }
+
+          function addImage(x, y, src, persist) {
+            var img = new Image();
+            var item = { x: x, y: y, src: src, img: img };
+
+            img.onload = function () { item.ready = true; };
+            img.src = src;
+            images.push(item);
+
+            if (persist) {
+              saveImages();
+            }
+          }
+
+          function loadImages() {
+            try {
+              JSON.parse(localStorage.getItem(imagesKey) || "[]").forEach(function (it) {
+                addImage(it.x, it.y, it.src, false);
+              });
+            } catch (e) {}
+          }
+
+          function removeImageAtCursor() {
+            var before = images.length;
+
+            images = images.filter(function (it) { return it.x !== cursorX || it.y !== cursorY; });
+
+            if (images.length !== before) {
+              saveImages();
+              return true;
+            }
+
+            return false;
+          }
+
+          function onPaste(event) {
+            var items = (event.clipboardData && event.clipboardData.items) || [];
+            var k;
+
+            if (!guestbookApp || !guestbookApp.active) {
+              return;
+            }
+
+            for (k = 0; k < items.length; k += 1) {
+              if (items[k].type.indexOf("image/") === 0) {
+                var file = items[k].getAsFile();
+                var reader = new FileReader();
+                var px = cursorX;
+                var py = cursorY;
+
+                event.preventDefault();
+                reader.onload = function () {
+                  var src = new Image();
+
+                  src.onload = function () {
+                    var scale = Math.min(1, 360 / src.width);
+                    var c = document.createElement("canvas");
+
+                    c.width = Math.max(1, Math.round(src.width * scale));
+                    c.height = Math.max(1, Math.round(src.height * scale));
+                    c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+                    addImage(px, py, c.toDataURL("image/jpeg", 0.85), true);
+                  };
+                  src.src = reader.result;
+                };
+                reader.readAsDataURL(file);
+                return;
+              }
+            }
+          }
+
           function moveCursor(dx, dy) {
             cursorX += dx;
             cursorY += dy;
@@ -994,6 +1076,11 @@
               return;
             }
 
+            if ((event.key === "Backspace" || event.key === "Delete") && removeImageAtCursor()) {
+              event.preventDefault();
+              return;
+            }
+
             if (event.key === "Backspace") {
               event.preventDefault();
               moveCursor(-1, 0);
@@ -1093,6 +1180,12 @@
             ctx.clearRect(0, 0, width, height);
             ctx.fillStyle = "#000000";
 
+            images.forEach(function (it) {
+              if (it.ready) {
+                ctx.drawImage(it.img, it.x * cellWidth - offsetX, it.y * cellHeight - offsetY);
+              }
+            });
+
             cellMap.forEach(function (value, key) {
               var comma = key.indexOf(",");
               var worldX;
@@ -1177,7 +1270,9 @@
           ctx = canvas.getContext("2d");
 
           loadFromStorage();
+          loadImages();
 
+          window.addEventListener("paste", onPaste);
           canvas.addEventListener("wheel", onWheel, { passive: false });
           canvas.addEventListener("pointerdown", onPointerDown);
           window.addEventListener("pointermove", onPointerMove);
