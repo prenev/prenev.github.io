@@ -881,12 +881,23 @@
               return { k: 1, from: -1, to: -1 };
             }
 
-            for (x = left; x <= left + 17; x += 17) {
-              if (cellAt(x, y) === "#") {
-                level = cellAt(x + 1, y) === "#" ? 2 : 1;
+            var starts = [left];
+            var prefix = "";
 
-                if (cellAt(x + level, y) === " " && cellAt(x + level + 1, y) !== " ") {
-                  return { k: headingScale[level], from: x, to: x + level - 1 };
+            for (x = left; x < left + 16; x += 1) {
+              prefix += cellAt(x, y);
+
+              if (/^\d{1,2}(st|nd|rd|th) [a-z]{3} \d\d:\d\d $/.test(prefix)) {
+                starts.push(x + 1);
+              }
+            }
+
+            for (x = 0; x < starts.length; x += 1) {
+              if (cellAt(starts[x], y) === "#") {
+                level = cellAt(starts[x] + 1, y) === "#" ? 2 : 1;
+
+                if (cellAt(starts[x] + level, y) === " " && cellAt(starts[x] + level + 1, y) !== " ") {
+                  return { k: headingScale[level], from: starts[x], to: starts[x] + level - 1 };
                 }
               }
             }
@@ -896,6 +907,176 @@
 
           function rowScale(y) {
             return headInfo(y).k;
+          }
+
+          // Slash command: "/pomo [minutes] [task]" + Enter starts a timer; "/pomo stop" cancels it.
+          var pomoKey = "free_text_pomo_v1";
+          var pomo = { timer: null, log: [] };
+          var pomoNode = null;
+          var pomoTick = 0;
+
+          function pomoSave() {
+            try {
+              localStorage.setItem(pomoKey, JSON.stringify({ timer: pomo.timer, log: pomo.log }));
+            } catch (e) {}
+          }
+
+          function pomoLoad() {
+            try {
+              var saved = JSON.parse(localStorage.getItem(pomoKey) || "{}");
+
+              pomo.timer = saved.timer || null;
+              pomo.log = Array.isArray(saved.log) ? saved.log : [];
+            } catch (e) {}
+          }
+
+          function pomoToday() {
+            var start = new Date();
+
+            start.setHours(0, 0, 0, 0);
+
+            return pomo.log.filter(function (t) { return t >= start.getTime(); }).length;
+          }
+
+          function writeAt(x, y, text) {
+            Array.from(text).forEach(function (ch) {
+              setCell(x, y, ch);
+              x += ch.length > 1 ? 2 : 1;
+            });
+          }
+
+          function pomoBeep() {
+            try {
+              var ac = new (window.AudioContext || window.webkitAudioContext)();
+              var osc = ac.createOscillator();
+
+              osc.frequency.value = 660;
+              osc.connect(ac.destination);
+              osc.start();
+              osc.stop(ac.currentTime + 0.25);
+            } catch (e) {}
+          }
+
+          function pomoRender() {
+            var t = pomo.timer;
+            var left;
+            var mm;
+            var ss;
+
+            if (!pomoNode) {
+              return;
+            }
+
+            if (!t) {
+              pomoNode.textContent = pomoToday() ? "\u{1F345}\u00d7" + pomoToday() : "type /pomo";
+              if (guestbookApp && guestbookApp.active) {
+                document.title = "free text editor";
+              }
+
+              return;
+            }
+
+            left = Math.max(0, Math.round((t.end - Date.now()) / 1000));
+            mm = Math.floor(left / 60);
+            ss = left % 60;
+            pomoNode.textContent =
+              "\u{1F345} " + (mm < 10 ? "0" : "") + mm + ":" + (ss < 10 ? "0" : "") + ss + (t.task ? " " + t.task : "");
+            if (guestbookApp && guestbookApp.active) {
+              document.title = (mm < 10 ? "0" : "") + mm + ":" + (ss < 10 ? "0" : "") + ss + " \u{1F345}";
+            }
+          }
+
+          function pomoFinish(ok) {
+            var t = pomo.timer;
+
+            if (!t) {
+              return;
+            }
+
+            setCell(t.x, t.y, ok ? "\u2705" : "\u23F9");
+            pomo.timer = null;
+
+            if (ok) {
+              pomo.log.push(Date.now());
+              pomoBeep();
+            }
+
+            pomoSave();
+            pomoRender();
+          }
+
+          function pomoLoop() {
+            window.clearInterval(pomoTick);
+            pomoTick = window.setInterval(function () {
+              if (pomo.timer && Date.now() >= pomo.timer.end) {
+                pomoFinish(true);
+              }
+
+              pomoRender();
+            }, 1000);
+          }
+
+          // Returns true if the row held a /pomo command (rewritten in place).
+          function runPomoCommand(y) {
+            var left = null;
+            var right = null;
+            var text = "";
+            var m;
+            var x;
+
+            cellMap.forEach(function (value, key) {
+              var comma = key.indexOf(",");
+              var wx = parseInt(key, 10);
+
+              if (parseInt(key.slice(comma + 1), 10) !== y) {
+                return;
+              }
+
+              left = left === null ? wx : Math.min(left, wx);
+              right = right === null ? wx : Math.max(right, wx);
+            });
+
+            if (left === null) {
+              return false;
+            }
+
+            for (x = left; x <= right; x += 1) {
+              text += cellAt(x, y);
+            }
+
+            m = /(^|\s)\/pomo(?:\s+(.*))?$/.exec(text);
+
+            if (!m) {
+              return false;
+            }
+
+            var slashX = left + m.index + m[1].length;
+            var arg = (m[2] || "").trim();
+            var minutes = 25;
+            var num = /^(\d{1,3})(?:\s+|$)/.exec(arg);
+
+            for (x = slashX; x <= right + 1; x += 1) {
+              setCell(x, y, "");
+            }
+
+            if (arg === "stop") {
+              pomoFinish(false);
+              return true;
+            }
+
+            if (num) {
+              minutes = Math.max(1, parseInt(num[1], 10));
+              arg = arg.slice(num[0].length);
+            }
+
+            pomoFinish(false);
+            pomo.timer = { end: Date.now() + minutes * 60000, task: arg, x: slashX, y: y };
+            writeAt(slashX, y, "\u{1F345} " + arg);
+            pomoSave();
+            pomoLoop();
+            pomoRender();
+
+            return true;
           }
 
           // Emoji picker: typing ":" opens it; keep typing to filter.
@@ -1129,6 +1310,49 @@
             }
           }
 
+          // Timestamp like "8th oct 18:34"; skipped when a nearby line already shows today's date.
+          function dateLabel(d) {
+            var day = d.getDate();
+            var suffix = day % 10 === 1 && day !== 11 ? "st" : day % 10 === 2 && day !== 12 ? "nd" : day % 10 === 3 && day !== 13 ? "rd" : "th";
+
+            return day + suffix + " " + ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"][d.getMonth()];
+          }
+
+          function timeLabel(d) {
+            return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":" + (d.getMinutes() < 10 ? "0" : "") + d.getMinutes();
+          }
+
+          function neighborHasDate(label) {
+            var rows = {};
+            var y;
+
+            cellMap.forEach(function (value, key) {
+              var comma = key.indexOf(",");
+              var wx = parseInt(key, 10);
+              var wy = parseInt(key.slice(comma + 1), 10);
+
+              if (Math.abs(wy - cursorY) <= 3 && wx >= cursorX - 30 && wx <= cursorX + 60) {
+                (rows[wy] = rows[wy] || []).push([wx, value]);
+              }
+            });
+
+            for (y in rows) {
+              var line = "";
+              var last = null;
+
+              rows[y].sort(function (p, q) { return p[0] - q[0]; }).forEach(function (c) {
+                line += (last !== null && c[0] > last + 1 ? " " : "") + c[1];
+                last = c[0];
+              });
+
+              if (line.indexOf(label + " ") !== -1) {
+                return true;
+              }
+            }
+
+            return false;
+          }
+
           function insertTextAtCursor(text) {
             var idx;
 
@@ -1137,14 +1361,11 @@
             }
 
             if (needStamp) {
-              var now = new Date();
-              var pad = function (n) { return (n < 10 ? "0" : "") + n; };
-              var stamp =
-                now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()) +
-                " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + " ";
-
               needStamp = false;
-              insertTextAtCursor(stamp);
+
+              if (!neighborHasDate(dateLabel(new Date()))) {
+                insertTextAtCursor(dateLabel(new Date()) + " " + timeLabel(new Date()) + " ");
+              }
             }
 
             var chars = Array.from(text);
@@ -1312,6 +1533,7 @@
 
             if (event.key === "Enter") {
               event.preventDefault();
+              runPomoCommand(cursorY);
               cursorX = guestbookStartPoint.x;
               cursorY += 1;
               hidePicker();
@@ -1498,7 +1720,8 @@
             '<a href="#">..</a> | drag/wheel: pan | click/tap: cursor | type: write | cells: ' +
             "<span id=\"guestbook-cell-count\">0</span>" +
             " | " +
-            "<span id=\"guestbook-sync-status\">starting</span>";
+            "<span id=\"guestbook-sync-status\">starting</span>" +
+            " | <span id=\"pomo-status\"></span>";
 
           canvas.id = "guestbook-canvas";
           canvas.setAttribute("tabindex", "0");
@@ -1524,6 +1747,10 @@
 
           cellCountNode = toolbar.querySelector("#guestbook-cell-count");
           syncStatusNode = toolbar.querySelector("#guestbook-sync-status");
+          pomoNode = toolbar.querySelector("#pomo-status");
+          pomoLoad();
+          pomoLoop();
+          pomoRender();
 
           ctx = canvas.getContext("2d");
 
