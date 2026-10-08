@@ -295,7 +295,7 @@
               return " ";
             }
 
-            return value.charAt(0);
+            return Array.from(value)[0];
           }
 
           function safeTimestamp(value) {
@@ -849,14 +849,178 @@
           }
 
           // Convert a mouse position on screen into absolute world cell coordinates.
+          // Markdown-ish: "# " / "## " rows render larger; **text** renders bold.
+          var headingScale = [1, 1.3, 1.15];
+
+          function cellAt(x, y) {
+            return cellMap.has(mapKey(x, y)) ? cellMap.get(mapKey(x, y)) : " ";
+          }
+
+          // Heading marker: "#"/"##" + space, at the row start or after the timestamp.
+          function headInfo(y) {
+            var x;
+            var level;
+
+            for (x = 0; x <= 20; x += 1) {
+              if (cellAt(x, y) === "#" && (x === 0 || cellAt(x - 1, y) === " ")) {
+                level = 1;
+
+                if (cellAt(x + 1, y) === "#") {
+                  level = 2;
+                }
+
+                if (cellAt(x + level, y) === " " && cellAt(x + level + 1, y) !== " ") {
+                  return { k: headingScale[level], from: x, to: x + level - 1 };
+                }
+              }
+            }
+
+            return { k: 1, from: -1, to: -1 };
+          }
+
+          function rowScale(y) {
+            return headInfo(y).k;
+          }
+
+          // Emoji picker: typing ":" opens it; keep typing to filter.
+          var emojis = {
+            smile: "😀", grin: "😁", joy: "😂", wink: "😉", blush: "😊", heart_eyes: "😍", cool: "😎",
+            thinking: "🤔", cry: "😢", sob: "😭", angry: "😠", sleepy: "😴", scream: "😱", party: "🥳",
+            heart: "❤️", broken_heart: "💔", fire: "🔥", star: "⭐", sparkles: "✨", sun: "☀️", moon: "🌙",
+            cloud: "☁️", rain: "🌧️", snow: "❄️", tree: "🌳", flower: "🌸", leaf: "🍃", cat: "🐱", dog: "🐶",
+            thumbsup: "👍", thumbsdown: "👎", clap: "👏", wave: "👋", pray: "🙏", muscle: "💪", eyes: "👀",
+            ok: "👌", peace: "✌️", coffee: "☕", pizza: "🍕", cake: "🎂", music: "🎵", book: "📖",
+            camera: "📷", film: "🎬", rocket: "🚀", check: "✅", x: "❌", warning: "⚠️", bulb: "💡", "100": "💯"
+          };
+          var picker = { colonX: 0, matches: [], sel: 0, dismissed: false };
+          var pickerNode = document.createElement("div");
+
+          pickerNode.style.cssText =
+            "position:fixed;display:none;z-index:60;background:#fff;border:1px solid #000;" +
+            "font:12px/1.5 monospace;padding:2px 0;min-width:120px;";
+
+          function hidePicker() {
+            picker.matches = [];
+            pickerNode.style.display = "none";
+          }
+
+          function renderPicker() {
+            var rect = canvas.getBoundingClientRect();
+            var k = rowScale(cursorY);
+
+            if (picker.matches.length === 0) {
+              hidePicker();
+              return;
+            }
+
+            pickerNode.innerHTML = "";
+            picker.matches.forEach(function (name, i) {
+              var row = document.createElement("div");
+
+              row.textContent = emojis[name] + "  " + name;
+              row.style.cssText = "padding:0 8px;cursor:pointer;" + (i === picker.sel ? "background:#ffff00;" : "");
+              row.addEventListener("pointerdown", function (e) {
+                e.preventDefault();
+                picker.sel = i;
+                pickEmoji();
+              });
+              pickerNode.appendChild(row);
+            });
+            pickerNode.style.left = Math.max(0, rect.left + cursorX * cellWidth * k - offsetX) + "px";
+            pickerNode.style.top = rect.top + (cursorY + 1) * cellHeight - offsetY + 2 + "px";
+            pickerNode.style.display = "block";
+          }
+
+          function updatePicker() {
+            var x = cursorX;
+            var q = "";
+            var c;
+
+            hidePicker();
+
+            while (x > guestbookStartPoint.x && q.length < 12) {
+              c = cellAt(x - 1, cursorY);
+
+              if (/^[a-z0-9_]$/i.test(c)) {
+                q = c + q;
+                x -= 1;
+              } else {
+                break;
+              }
+            }
+
+            if (x <= guestbookStartPoint.x || cellAt(x - 1, cursorY) !== ":") {
+              picker.dismissed = false;
+              return;
+            }
+
+            if (x - 1 > guestbookStartPoint.x && /^[a-z0-9_]$/i.test(cellAt(x - 2, cursorY))) {
+              return;
+            }
+
+            if (picker.dismissed) {
+              return;
+            }
+
+            picker.colonX = x - 1;
+            q = q.toLowerCase();
+            picker.matches = Object.keys(emojis)
+              .filter(function (n) { return n.indexOf(q) === 0; })
+              .concat(Object.keys(emojis).filter(function (n) { return q && n.indexOf(q) > 0; }))
+              .slice(0, 6);
+            picker.sel = 0;
+            renderPicker();
+          }
+
+          // Typing a full ":name:" turns it into the emoji.
+          function finishShortcode() {
+            var x = cursorX;
+            var q = "";
+
+            while (x > guestbookStartPoint.x && /^[a-z0-9_]$/i.test(cellAt(x - 1, cursorY))) {
+              q = cellAt(x - 1, cursorY) + q;
+              x -= 1;
+            }
+
+            if (!q || cellAt(x - 1, cursorY) !== ":" || !emojis[q.toLowerCase()]) {
+              return false;
+            }
+
+            picker.colonX = x - 1;
+            picker.matches = [q.toLowerCase()];
+            picker.sel = 0;
+            pickEmoji();
+            return true;
+          }
+
+          function pickEmoji() {
+            var x;
+            var emoji = emojis[picker.matches[picker.sel]];
+
+            if (!emoji) {
+              return;
+            }
+
+            for (x = picker.colonX; x < cursorX; x += 1) {
+              setCell(x, cursorY, "");
+            }
+
+            cursorX = picker.colonX;
+            setCell(cursorX, cursorY, emoji);
+            cursorX += 2;
+            hidePicker();
+          }
+
           function clientToWorld(clientX, clientY) {
             var rect = canvas.getBoundingClientRect();
             var screenX = clientX - rect.left;
             var screenY = clientY - rect.top;
 
+            var wy = Math.floor((screenY + offsetY) / cellHeight);
+
             return {
-              worldX: Math.floor((screenX + offsetX) / cellWidth),
-              worldY: Math.floor((screenY + offsetY) / cellHeight),
+              worldX: Math.floor((screenX + offsetX) / (cellWidth * rowScale(wy))),
+              worldY: wy,
             };
           }
 
@@ -943,6 +1107,10 @@
           function moveCursor(dx, dy) {
             cursorX += dx;
             cursorY += dy;
+
+            if (dy !== 0) {
+              hidePicker();
+            }
           }
 
           function insertTextAtCursor(text) {
@@ -963,8 +1131,10 @@
               insertTextAtCursor(stamp);
             }
 
-            for (idx = 0; idx < text.length; idx += 1) {
-              var ch = text.charAt(idx);
+            var chars = Array.from(text);
+
+            for (idx = 0; idx < chars.length; idx += 1) {
+              var ch = chars[idx];
 
               if (ch === "\r") {
                 continue;
@@ -976,9 +1146,15 @@
                 continue;
               }
 
+              if (ch === ":" && finishShortcode()) {
+                continue;
+              }
+
               setCell(cursorX, cursorY, ch);
-              moveCursor(1, 0);
+              moveCursor(ch.length > 1 ? 2 : 1, 0);
             }
+
+            updatePicker();
           }
 
           // Trackpad/mouse-wheel panning updates the camera offset.
@@ -1049,6 +1225,7 @@
               cursorY = hit.worldY;
               cursorActive = true;
               needStamp = true;
+              hidePicker();
               canvas.focus();
               mobileInput.focus();
             }
@@ -1076,6 +1253,28 @@
               return;
             }
 
+            if (picker.matches.length > 0) {
+              if (event.key === "Enter" || event.key === "Tab") {
+                event.preventDefault();
+                pickEmoji();
+                return;
+              }
+
+              if (event.key === "Escape") {
+                event.preventDefault();
+                picker.dismissed = true;
+                hidePicker();
+                return;
+              }
+
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                picker.sel = (picker.sel + (event.key === "ArrowDown" ? 1 : picker.matches.length - 1)) % picker.matches.length;
+                renderPicker();
+                return;
+              }
+            }
+
             if ((event.key === "Backspace" || event.key === "Delete") && removeImageAtCursor()) {
               event.preventDefault();
               return;
@@ -1085,6 +1284,7 @@
               event.preventDefault();
               moveCursor(-1, 0);
               setCell(cursorX, cursorY, "");
+              updatePicker();
               return;
             }
 
@@ -1098,6 +1298,7 @@
               event.preventDefault();
               cursorX = guestbookStartPoint.x;
               cursorY += 1;
+              hidePicker();
               return;
             }
 
@@ -1186,35 +1387,75 @@
               }
             });
 
+            var rows = {};
+
             cellMap.forEach(function (value, key) {
               var comma = key.indexOf(",");
-              var worldX;
-              var worldY;
-              var drawX;
-              var drawY;
+              var worldX = parseInt(key.slice(0, comma), 10);
+              var worldY = parseInt(key.slice(comma + 1), 10);
 
-              if (comma <= 0) {
+              if (comma <= 0 || !isFinite(worldX) || !isFinite(worldY)) {
                 return;
               }
 
-              worldX = parseInt(key.slice(0, comma), 10);
-              worldY = parseInt(key.slice(comma + 1), 10);
-
-              if (!isFinite(worldX) || !isFinite(worldY)) {
+              if (worldY < minY || worldY > maxY) {
                 return;
               }
 
-              if (worldX < minX || worldX > maxX || worldY < minY || worldY > maxY) {
-                return;
-              }
-
-              drawX = worldX * cellWidth - offsetX;
-              drawY = worldY * cellHeight - offsetY;
-              ctx.fillText(value, drawX, drawY + baseline);
+              (rows[worldY] = rows[worldY] || []).push([worldX, value]);
             });
 
+            Object.keys(rows).forEach(function (rowKey) {
+              var y = parseInt(rowKey, 10);
+              var cells = rows[rowKey].sort(function (a, b) { return a[0] - b[0]; });
+              var head = headInfo(y);
+              var k = head.k;
+              var bold = false;
+              var n;
+
+              for (n = 0; n < cells.length; n += 1) {
+                var x = cells[n][0];
+                var ch = cells[n][1];
+                var next = cells[n + 1];
+                var marker = false;
+
+                if (ch === "*" && next && next[0] === x + 1 && next[1] === "*") {
+                  if (bold || cells.slice(n + 2).some(function (c, i, a) {
+                    return c[1] === "*" && a[i + 1] && a[i + 1][0] === c[0] + 1 && a[i + 1][1] === "*";
+                  })) {
+                    marker = true;
+                  }
+                }
+
+                var isHash = k > 1 && x >= head.from && x <= head.to;
+                var drawX = x * cellWidth * k - offsetX;
+                var drawY = y * cellHeight - offsetY;
+
+                if (x * k < minX - 1 || x * k > maxX) {
+                  continue;
+                }
+
+                if (marker) {
+                  ctx.fillStyle = "#bbbbbb";
+                  ctx.font = "bold 16px monospace";
+                  ctx.fillText("*", drawX, drawY + baseline);
+                  ctx.fillText("*", drawX + cellWidth * k, drawY + baseline);
+                  bold = !bold;
+                  n += 1;
+                  continue;
+                }
+
+                ctx.fillStyle = isHash ? "#bbbbbb" : "#000000";
+                ctx.font = (k > 1 ? "bold " + Math.round(16 * k) : bold ? "bold 16" : "16") + "px monospace";
+                ctx.fillText(ch, drawX, drawY + baseline - (k > 1 ? 1 : 0));
+              }
+            });
+
+            ctx.fillStyle = "#000000";
+            ctx.font = "16px monospace";
+
             if (cursorActive && Math.floor(now / 450) % 2 === 0) {
-              var cursorDrawX = cursorX * cellWidth - offsetX;
+              var cursorDrawX = cursorX * cellWidth * rowScale(cursorY) - offsetX;
               var cursorDrawY = cursorY * cellHeight - offsetY;
 
               if (
@@ -1263,6 +1504,7 @@
           container.appendChild(canvas);
           container.appendChild(mobileInput);
           document.body.appendChild(container);
+          document.body.appendChild(pickerNode);
 
           cellCountNode = toolbar.querySelector("#guestbook-cell-count");
           syncStatusNode = toolbar.querySelector("#guestbook-sync-status");
