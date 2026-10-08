@@ -285,6 +285,10 @@
           var remotePollIntervalMs = 7000;
           var cellMap = new Map();
           var images = [];
+          var shapes = [];
+          var shapesKey = "free_text_shapes_v1";
+          var drawMode = null;
+          var drawing = null;
           var imagesKey = "free_text_images_v1";
           var versionMap = new Map();
           var cellCountNode = null;
@@ -1021,6 +1025,29 @@
             }, 1000);
           }
 
+          // A tag runs from its "/tag name" line until "/end"; while open it covers the block below it.
+          var rangeCache = new Map();
+
+          function tagRange(g) {
+            var box;
+
+            if (g.open) {
+              var hit = rangeCache.get(g);
+
+              if (hit && Date.now() - hit.at < 400) {
+                return hit.r;
+              }
+
+              box = clusterAround(g.x0, g.y0);
+              hit = { at: Date.now(), r: { y0: g.y0, y1: box ? box.y1 : g.y0 } };
+              rangeCache.set(g, hit);
+
+              return hit.r;
+            }
+
+            return { y0: g.y0, y1: g.y1 };
+          }
+
           // Group of notes around (x, y): cells within 4 columns / 1 row of each other.
           function clusterAround(x, y) {
             var seen = {};
@@ -1098,7 +1125,7 @@
 
             var text = rowText(y, left, right);
 
-            m = /(^|\s)\/(pomo|tag)(?:\s+(.*))?$/.exec(text);
+            m = /(^|\s)\/(pomo|tag|end|box|circle|line|arrow)(?:\s+(.*))?$/.exec(text);
 
             if (!m) {
               return false;
@@ -1111,13 +1138,18 @@
               setCell(x, y, "");
             }
 
+            if (/^(box|circle|line|arrow)$/.test(m[2])) {
+              startDrawMode(m[2]);
+              return true;
+            }
+
             if (m[2] === "tag") {
               var name = arg.replace(/^#/, "").replace(/\s+/g, "_");
 
               if (!name) {
                 openFinder(
                   tags.map(function (g) {
-                    return { label: "#" + g.name, hint: rowText(g.y0, g.x0, g.x0 + 40).trim(), x: g.x0, y: g.y0 };
+                    return { label: "#" + g.name, hint: g.open ? "open" : "", x: g.x0, y: g.y0, tag: g };
                   }),
                   "tags"
                 );
@@ -1125,12 +1157,25 @@
               }
 
               writeAt(slashX, y, "#" + name);
+              tags.push({ name: name, x0: slashX, y0: y, y1: y, open: true });
+              pomoSave();
 
-              var box = clusterAround(slashX, y);
+              return true;
+            }
 
-              if (box) {
-                box.name = name;
-                tags.push(box);
+            if (m[2] === "end") {
+              var openTag = null;
+
+              tags.forEach(function (g) {
+                if (g.open && g.y0 <= y && (!openTag || g.y0 > openTag.y0)) {
+                  openTag = g;
+                }
+              });
+
+              if (openTag) {
+                openTag.open = false;
+                openTag.y1 = Math.max(openTag.y0, y - 1);
+                writeAt(slashX, y, "/" + openTag.name);
                 pomoSave();
               }
 
@@ -1223,6 +1268,18 @@
           function finderPick() {
             var it = finder.shown[finder.sel];
 
+            if (it && it.tag) {
+              var r = tagRange(it.tag);
+              var notes = searchItems(r.y0 + 1, r.y1, it.tag.x0 - 4).filter(function (n) { return !n.tag; });
+
+              finder.items = [{ label: "\u2192 #" + it.tag.name, hint: "go to tag", x: it.x, y: it.y }].concat(notes);
+              finder.sel = 0;
+              finder.input.value = "";
+              finder.input.placeholder = "#" + it.tag.name;
+              finderRender();
+              return;
+            }
+
             closeFinder();
 
             if (it) {
@@ -1275,17 +1332,22 @@
             finder.input.focus();
           }
 
-          function searchItems() {
+          function searchItems(fromY, toY, minX) {
             var rows = {};
-            var items = tags.map(function (g) {
-              return { label: "#" + g.name, hint: "tag", x: g.x0, y: g.y0 };
+            var items = (fromY === undefined ? tags : []).map(function (g) {
+              return { label: "#" + g.name, hint: "tag", x: g.x0, y: g.y0, tag: g };
             });
 
             cellMap.forEach(function (value, key) {
               var comma = key.indexOf(",");
               var wy = parseInt(key.slice(comma + 1), 10);
+              var wx = parseInt(key, 10);
 
-              (rows[wy] = rows[wy] || []).push([parseInt(key, 10), value]);
+              if (fromY !== undefined && (wy < fromY || wy > toY || wx < minX)) {
+                return;
+              }
+
+              (rows[wy] = rows[wy] || []).push([wx, value]);
             });
 
             Object.keys(rows).sort(function (a, b) { return a - b; }).forEach(function (rowKey) {
@@ -1494,17 +1556,86 @@
             } catch (e) {}
           }
 
+          // Shapes: "/box", "/circle", "/line", "/arrow" then drag on the canvas.
+          function saveShapes() {
+            try {
+              localStorage.setItem(shapesKey, JSON.stringify(shapes));
+            } catch (e) {}
+          }
+
+          function loadShapes() {
+            try {
+              shapes = JSON.parse(localStorage.getItem(shapesKey) || "[]");
+            } catch (e) {}
+          }
+
+          function startDrawMode(kind) {
+            drawMode = kind;
+            canvas.style.cursor = "crosshair";
+            setSyncStatus("drag to draw " + kind + " (esc cancels)");
+          }
+
+          function endDrawMode() {
+            drawMode = null;
+            drawing = null;
+            canvas.style.cursor = "";
+            setSyncStatus(guestbookSharedEndpoint ? "synced" : "local only");
+          }
+
+          function drawShape(sh, color) {
+            var x0 = Math.min(sh.x0, sh.x1) * cellWidth - offsetX;
+            var y0 = Math.min(sh.y0, sh.y1) * cellHeight - offsetY;
+            var w = (Math.abs(sh.x1 - sh.x0) + 1) * cellWidth;
+            var h = (Math.abs(sh.y1 - sh.y0) + 1) * cellHeight;
+            var ax = (sh.x0 + 0.5) * cellWidth - offsetX;
+            var ay = (sh.y0 + 0.5) * cellHeight - offsetY;
+            var bx = (sh.x1 + 0.5) * cellWidth - offsetX;
+            var by = (sh.y1 + 0.5) * cellHeight - offsetY;
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+
+            if (sh.t === "box") {
+              ctx.rect(x0, y0, w, h);
+            } else if (sh.t === "circle") {
+              ctx.ellipse(x0 + w / 2, y0 + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+            } else {
+              ctx.moveTo(ax, ay);
+              ctx.lineTo(bx, by);
+
+              if (sh.t === "arrow") {
+                var ang = Math.atan2(by - ay, bx - ax);
+
+                ctx.moveTo(bx, by);
+                ctx.lineTo(bx - 10 * Math.cos(ang - 0.45), by - 10 * Math.sin(ang - 0.45));
+                ctx.moveTo(bx, by);
+                ctx.lineTo(bx - 10 * Math.cos(ang + 0.45), by - 10 * Math.sin(ang + 0.45));
+              }
+            }
+
+            ctx.stroke();
+          }
+
           function removeImageAtCursor() {
             var before = images.length;
 
+            var beforeShapes = shapes.length;
+
             images = images.filter(function (it) { return it.x !== cursorX || it.y !== cursorY; });
+            shapes = shapes.filter(function (sh) {
+              return Math.min(sh.x0, sh.x1) !== cursorX || Math.min(sh.y0, sh.y1) !== cursorY;
+            });
+
+            if (shapes.length !== beforeShapes) {
+              saveShapes();
+            }
 
             if (images.length !== before) {
               saveImages();
-              return true;
             }
 
-            return false;
+            return images.length !== before || shapes.length !== beforeShapes;
           }
 
           function onPaste(event) {
@@ -1649,6 +1780,18 @@
               return;
             }
 
+            if (drawMode) {
+              var p = clientToWorld(event.clientX, event.clientY);
+
+              drawing = { t: drawMode, x0: p.worldX, y0: p.worldY, x1: p.worldX, y1: p.worldY };
+              activePointerId = event.pointerId;
+              if (typeof canvas.setPointerCapture === "function") {
+                canvas.setPointerCapture(event.pointerId);
+              }
+              event.preventDefault();
+              return;
+            }
+
             dragging = true;
             moved = false;
             activePointerId = event.pointerId;
@@ -1667,6 +1810,14 @@
           function onPointerMove(event) {
             var dx;
             var dy;
+
+            if (drawing && activePointerId === event.pointerId) {
+              var q = clientToWorld(event.clientX, event.clientY);
+
+              drawing.x1 = q.worldX;
+              drawing.y1 = q.worldY;
+              return;
+            }
 
             if (!dragging || activePointerId !== event.pointerId) {
               return;
@@ -1689,6 +1840,17 @@
           // End dragging; if no movement happened, treat it as click/tap to place cursor.
           function onPointerUp(event) {
             var hit;
+
+            if (drawing && activePointerId === event.pointerId) {
+              if (drawing.x0 !== drawing.x1 || drawing.y0 !== drawing.y1) {
+                shapes.push(drawing);
+                saveShapes();
+              }
+
+              activePointerId = null;
+              endDrawMode();
+              return;
+            }
 
             if (!dragging || activePointerId !== event.pointerId) {
               return;
@@ -1729,6 +1891,12 @@
             }
 
             if (event.metaKey || event.ctrlKey) {
+              return;
+            }
+
+            if (event.key === "Escape" && drawMode) {
+              event.preventDefault();
+              endDrawMode();
               return;
             }
 
@@ -1867,6 +2035,12 @@
               }
             });
 
+            shapes.forEach(function (sh) { drawShape(sh, "#000000"); });
+
+            if (drawing) {
+              drawShape(drawing, "#888888");
+            }
+
             var rows = {};
 
             cellMap.forEach(function (value, key) {
@@ -1933,7 +2107,9 @@
 
             tags.forEach(function (g) {
               ctx.fillStyle = "#e4e4e4";
-              ctx.fillRect(g.x0 * cellWidth - offsetX - 5, g.y0 * cellHeight - offsetY, 2, (g.y1 - g.y0 + 1) * cellHeight);
+              var r = tagRange(g);
+
+              ctx.fillRect(g.x0 * cellWidth - offsetX - 5, r.y0 * cellHeight - offsetY, 2, (r.y1 - r.y0 + 1) * cellHeight);
             });
 
             if (pomo.timer && rows[pomo.timer.y]) {
@@ -2017,6 +2193,7 @@
 
           loadFromStorage();
           loadImages();
+          loadShapes();
 
           window.addEventListener("paste", onPaste);
           window.addEventListener("keydown", function (e) {
