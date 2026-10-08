@@ -856,18 +856,34 @@
             return cellMap.has(mapKey(x, y)) ? cellMap.get(mapKey(x, y)) : " ";
           }
 
-          // Heading marker: "#"/"##" + space, at the row start or after the timestamp.
+          // Heading marker: "#"/"##" + space, at the row's first cell or right after the timestamp.
           function headInfo(y) {
-            var x;
+            var left = null;
+            var suffix = "," + y;
             var level;
+            var x;
 
-            for (x = 0; x <= 20; x += 1) {
-              if (cellAt(x, y) === "#" && (x === 0 || cellAt(x - 1, y) === " ")) {
-                level = 1;
+            cellMap.forEach(function (value, key) {
+              var wx;
 
-                if (cellAt(x + 1, y) === "#") {
-                  level = 2;
-                }
+              if (key.slice(-suffix.length) !== suffix) {
+                return;
+              }
+
+              wx = parseInt(key, 10);
+
+              if (left === null || wx < left) {
+                left = wx;
+              }
+            });
+
+            if (left === null) {
+              return { k: 1, from: -1, to: -1 };
+            }
+
+            for (x = left; x <= left + 17; x += 17) {
+              if (cellAt(x, y) === "#") {
+                level = cellAt(x + 1, y) === "#" ? 2 : 1;
 
                 if (cellAt(x + level, y) === " " && cellAt(x + level + 1, y) !== " ") {
                   return { k: headingScale[level], from: x, to: x + level - 1 };
