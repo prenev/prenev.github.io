@@ -133,6 +133,19 @@
         line-height: 1.3;
       }
 
+      #guestbook-day {
+        position: fixed;
+        top: 8px;
+        right: 8px;
+        z-index: 55;
+        background: #ffffff;
+        color: #000000;
+        padding: 4px 8px;
+        font-family: monospace, sans-serif;
+        font-size: 12px;
+        line-height: 1.3;
+      }
+
       #guestbook-toolbar a,
       #guestbook-toolbar a:visited {
         color: #0000ee;
@@ -159,6 +172,148 @@
         var guestbookStartPoint = { x: 0, y: 0 };
         var guestbookApp = null;
         var i;
+
+        // One canvas per calendar day: every storage key is suffixed with ":YYYY-MM-DD".
+        var legacyImagesKey = "free_text_images_v1";
+        var legacyShapesKey = "free_text_shapes_v1";
+        var pomoStorageKey = "free_text_pomo_v1";
+        var dayPrefixes = [guestbookStorageKey, legacyImagesKey, legacyShapesKey];
+
+        function pad2(n) {
+          return (n < 10 ? "0" : "") + n;
+        }
+
+        function dayOf(date) {
+          return date.getFullYear() + "-" + pad2(date.getMonth() + 1) + "-" + pad2(date.getDate());
+        }
+
+        function todayKey() {
+          return dayOf(new Date());
+        }
+
+        function dayStorageKey(prefix, day) {
+          return prefix + ":" + day;
+        }
+
+        function dayHash(day) {
+          return day === todayKey() ? guestbookHash : guestbookHash + "=" + day;
+        }
+
+        function formatDay(day) {
+          var parts = day.split("-");
+          var d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+          var n = d.getDate();
+          var suffix = n % 10 === 1 && n !== 11 ? "st" : n % 10 === 2 && n !== 12 ? "nd" : n % 10 === 3 && n !== 13 ? "rd" : "th";
+
+          return (
+            ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d.getDay()] + " " + n + suffix + " " +
+            ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"][d.getMonth()] + " " +
+            d.getFullYear()
+          );
+        }
+
+        // Days that have anything saved, newest first (today is always included).
+        function listDays() {
+          var seen = {};
+          var k;
+
+          seen[todayKey()] = true;
+
+          try {
+            for (k = 0; k < localStorage.length; k += 1) {
+              var name = localStorage.key(k);
+              var m = /^(.*):(\d{4}-\d\d-\d\d)$/.exec(name || "");
+
+              if (m && dayPrefixes.indexOf(m[1]) !== -1) {
+                seen[m[2]] = true;
+              }
+            }
+          } catch (e) {}
+
+          return Object.keys(seen).sort().reverse();
+        }
+
+        // Old single-canvas data moves to the day it was last edited.
+        function migrateLegacy() {
+          var day = todayKey();
+          var raw;
+          var pomoRaw;
+
+          try {
+            raw = localStorage.getItem(guestbookStorageKey);
+
+            if (raw) {
+              var parsed = JSON.parse(raw);
+              var newest = 0;
+
+              if (parsed && parsed.cells && !Array.isArray(parsed.cells)) {
+                Object.keys(parsed.cells).forEach(function (key) {
+                  newest = Math.max(newest, safeTimestampOuter(parsed.cells[key] && parsed.cells[key].updatedAt));
+                });
+              }
+
+              if (newest > 0) {
+                day = dayOf(new Date(newest));
+              }
+
+              localStorage.setItem(dayStorageKey(guestbookStorageKey, day), raw);
+              localStorage.removeItem(guestbookStorageKey);
+            }
+
+            [legacyImagesKey, legacyShapesKey].forEach(function (prefix) {
+              var value = localStorage.getItem(prefix);
+
+              if (value) {
+                localStorage.setItem(dayStorageKey(prefix, day), value);
+                localStorage.removeItem(prefix);
+              }
+            });
+
+            pomoRaw = localStorage.getItem(pomoStorageKey);
+
+            if (pomoRaw) {
+              var saved = JSON.parse(pomoRaw);
+
+              if (saved.timer && !saved.timer.d) {
+                saved.timer.d = day;
+              }
+
+              (saved.log || []).forEach(function (e) {
+                if (e && typeof e === "object" && !e.d) {
+                  e.d = day;
+                }
+              });
+              (saved.tags || []).forEach(function (g) {
+                if (!g.d) {
+                  g.d = day;
+                }
+              });
+              localStorage.setItem(pomoStorageKey, JSON.stringify(saved));
+            }
+          } catch (e) {}
+        }
+
+        function safeTimestampOuter(value) {
+          var n = Number(value);
+
+          return isFinite(n) && n > 0 ? Math.floor(n) : 0;
+        }
+
+        function buildHomeHtml() {
+          var days = listDays();
+          var today = todayKey();
+          var lines = ['<span class="title">pranav ajay</span>', "└── free_text_editor"];
+
+          days.forEach(function (day, idx) {
+            lines.push(
+              "    " + (idx === days.length - 1 ? "└── " : "├── ") +
+                '<a href="' + dayHash(day) + '">' + formatDay(day) + "</a>" + (day === today ? " (today)" : "") +
+                ' <a href="#" data-delete="' + day + '">[delete]</a>'
+            );
+          });
+
+          return lines.join("\n");
+        }
 
         function injectMobileFitStyles(htmlText) {
           var styleTag =
@@ -273,7 +428,6 @@
           var cursorX = guestbookStartPoint.x;
           var cursorY = guestbookStartPoint.y;
           var cursorActive = true;
-          var needStamp = true;
           var frameId = 0;
           var localSaveTimer = 0;
           var remoteSaveTimer = 0;
@@ -286,10 +440,12 @@
           var cellMap = new Map();
           var images = [];
           var shapes = [];
-          var shapesKey = "free_text_shapes_v1";
           var drawMode = null;
           var drawing = null;
-          var imagesKey = "free_text_images_v1";
+          var currentDay = "";
+          var dayNode = null;
+          var pendingJump = null;
+          var allTags = [];
           var versionMap = new Map();
           var cellCountNode = null;
           var syncStatusNode = null;
@@ -356,6 +512,65 @@
             if (syncStatusNode) {
               syncStatusNode.textContent = text;
             }
+          }
+
+          // Remove a day's canvas and everything tied to it (tags, timer, session log).
+          function deleteDay(day) {
+            try {
+              dayPrefixes.forEach(function (prefix) {
+                localStorage.removeItem(dayStorageKey(prefix, day));
+              });
+            } catch (e) {}
+
+            allTags = allTags.filter(function (g) { return g.d !== day; });
+            pomo.log = pomo.log.filter(function (e) { return e.d !== day; });
+
+            if (pomo.timer && pomo.timer.d === day) {
+              pomo.timer = null;
+            }
+
+            pomoSave();
+            pomoRender();
+
+            if (currentDay === day) {
+              currentDay = "";
+              cellMap.clear();
+              versionMap.clear();
+              rangeCache.clear();
+              images = [];
+              shapes = [];
+              tags = [];
+            }
+          }
+
+          // Switch to another day's canvas (saves the current one first).
+          function loadDay(day) {
+            if (localSaveTimer) {
+              window.clearTimeout(localSaveTimer);
+              localSaveTimer = 0;
+            }
+
+            if (currentDay) {
+              saveToStorage();
+            }
+
+            currentDay = day;
+            cellMap.clear();
+            versionMap.clear();
+            rangeCache.clear();
+            images = [];
+            shapes = [];
+            tags = allTags.filter(function (g) { return g.d === day; });
+            drawMode = null;
+            drawing = null;
+            canvas.style.cursor = "";
+            hidePicker();
+            loadFromStorage();
+            loadImages();
+            loadShapes();
+            updateCellCount();
+            dayNode.textContent = formatDay(day);
+            centerOnStartPoint();
           }
 
           function centerOnStartPoint() {
@@ -609,10 +824,14 @@
 
           // Persist all non-empty world cells to localStorage.
           function saveToStorage() {
+            if (!currentDay) {
+              return;
+            }
+
             var snapshot = buildLocalSnapshot();
 
             try {
-              localStorage.setItem(guestbookStorageKey, JSON.stringify(snapshot));
+              localStorage.setItem(dayStorageKey(guestbookStorageKey, currentDay), JSON.stringify(snapshot));
             } catch (error) {
               // Ignore quota/storage errors.
             }
@@ -625,7 +844,7 @@
             var idx;
 
             try {
-              raw = localStorage.getItem(guestbookStorageKey);
+              raw = localStorage.getItem(dayStorageKey(guestbookStorageKey, currentDay));
             } catch (error) {
               return;
             }
@@ -683,11 +902,15 @@
             updateCellCount();
           }
 
+          function remoteUrl() {
+            return guestbookSharedEndpoint + (guestbookSharedEndpoint.indexOf("?") === -1 ? "?" : "&") + "day=" + currentDay;
+          }
+
           async function fetchRemoteSnapshot() {
             var response;
             var payload;
 
-            response = await fetch(guestbookSharedEndpoint, {
+            response = await fetch(remoteUrl(), {
               method: "GET",
               cache: "no-store",
             });
@@ -714,7 +937,7 @@
               headers["If-Match"] = etag;
             }
 
-            response = await fetch(guestbookSharedEndpoint, {
+            response = await fetch(remoteUrl(), {
               method: "PUT",
               headers: headers,
               body: JSON.stringify(snapshot),
@@ -914,7 +1137,7 @@
           }
 
           // Slash command: "/pomo [minutes] [task]" + Enter starts a timer; "/pomo stop" cancels it.
-          var pomoKey = "free_text_pomo_v1";
+          var pomoKey = pomoStorageKey;
           var pomo = { timer: null, log: [] };
           var tags = [];
           var pomoNode = null;
@@ -922,7 +1145,7 @@
 
           function pomoSave() {
             try {
-              localStorage.setItem(pomoKey, JSON.stringify({ timer: pomo.timer, log: pomo.log, tags: tags }));
+              localStorage.setItem(pomoKey, JSON.stringify({ timer: pomo.timer, log: pomo.log, tags: allTags }));
             } catch (e) {}
           }
 
@@ -932,9 +1155,9 @@
 
               pomo.timer = saved.timer || null;
               pomo.log = (Array.isArray(saved.log) ? saved.log : []).map(function (e) {
-                return typeof e === "number" ? { t: e, task: "", min: 25, ok: true, x: 0, y: 0 } : e;
+                return typeof e === "number" ? { t: e, task: "", min: 25, ok: true, x: 0, y: 0, d: todayKey() } : e;
               });
-              tags = Array.isArray(saved.tags) ? saved.tags : [];
+              allTags = Array.isArray(saved.tags) ? saved.tags : [];
             } catch (e) {}
           }
 
@@ -994,6 +1217,19 @@
             }
           }
 
+          function setCellOnOtherDay(day, x, y, ch) {
+            var key = dayStorageKey(guestbookStorageKey, day);
+
+            try {
+              var snap = JSON.parse(localStorage.getItem(key) || "{}");
+
+              if (snap && snap.cells && !Array.isArray(snap.cells)) {
+                snap.cells[mapKey(x, y)] = { ch: ch, updatedAt: Date.now() };
+                localStorage.setItem(key, JSON.stringify(snap));
+              }
+            } catch (e) {}
+          }
+
           function pomoFinish(ok) {
             var t = pomo.timer;
 
@@ -1001,10 +1237,15 @@
               return;
             }
 
-            setCell(t.x, t.y, ok ? "\u2705" : "\u23F9");
+            if (!t.d || t.d === currentDay) {
+              setCell(t.x, t.y, ok ? "\u2705" : "\u23F9");
+            } else {
+              setCellOnOtherDay(t.d, t.x, t.y, ok ? "\u2705" : "\u23F9");
+            }
+
             pomo.timer = null;
 
-            pomo.log.push({ t: Date.now(), task: t.task, min: t.min, ok: ok, x: t.x, y: t.y });
+            pomo.log.push({ t: Date.now(), task: t.task, min: t.min, ok: ok, x: t.x, y: t.y, d: t.d || currentDay });
 
             if (ok) {
               pomoBeep();
@@ -1157,7 +1398,10 @@
               }
 
               writeAt(slashX, y, "#" + name);
-              tags.push({ name: name, x0: slashX, y0: y, y1: y, open: true });
+              var created = { name: name, x0: slashX, y0: y, y1: y, open: true, d: currentDay };
+
+              tags.push(created);
+              allTags.push(created);
               pomoSave();
 
               return true;
@@ -1192,6 +1436,7 @@
                     hint: e.min + "m " + dateLabel(d) + " " + timeLabel(d),
                     x: e.x,
                     y: e.y,
+                    day: e.d,
                   };
                 }),
                 "sessions"
@@ -1213,7 +1458,7 @@
             }
 
             pomoFinish(false);
-            pomo.timer = { end: Date.now() + minutes * 60000, min: minutes, task: arg, x: slashX, y: y };
+            pomo.timer = { end: Date.now() + minutes * 60000, min: minutes, task: arg, x: slashX, y: y, d: currentDay };
             writeAt(slashX, y, "\u{1F345} " + arg);
             pomoSave();
             pomoLoop();
@@ -1282,7 +1527,10 @@
 
             closeFinder();
 
-            if (it) {
+            if (it && it.day && it.day !== currentDay) {
+              pendingJump = { x: it.x, y: it.y };
+              window.location.hash = dayHash(it.day);
+            } else if (it) {
               jumpTo(it.x, it.y);
             }
           }
@@ -1529,7 +1777,7 @@
           function saveImages() {
             try {
               localStorage.setItem(
-                imagesKey,
+                dayStorageKey(legacyImagesKey, currentDay),
                 JSON.stringify(images.map(function (it) { return { x: it.x, y: it.y, src: it.src }; }))
               );
             } catch (e) {}
@@ -1550,7 +1798,7 @@
 
           function loadImages() {
             try {
-              JSON.parse(localStorage.getItem(imagesKey) || "[]").forEach(function (it) {
+              JSON.parse(localStorage.getItem(dayStorageKey(legacyImagesKey, currentDay)) || "[]").forEach(function (it) {
                 addImage(it.x, it.y, it.src, false);
               });
             } catch (e) {}
@@ -1559,13 +1807,13 @@
           // Shapes: "/box", "/circle", "/line", "/arrow" then drag on the canvas.
           function saveShapes() {
             try {
-              localStorage.setItem(shapesKey, JSON.stringify(shapes));
+              localStorage.setItem(dayStorageKey(legacyShapesKey, currentDay), JSON.stringify(shapes));
             } catch (e) {}
           }
 
           function loadShapes() {
             try {
-              shapes = JSON.parse(localStorage.getItem(shapesKey) || "[]");
+              shapes = JSON.parse(localStorage.getItem(dayStorageKey(legacyShapesKey, currentDay)) || "[]");
             } catch (e) {}
           }
 
@@ -1683,7 +1931,7 @@
             }
           }
 
-          // Timestamp like "8th oct 18:34"; skipped when a nearby line already shows today's date.
+          // Used by "/pomo list" hints.
           function dateLabel(d) {
             var day = d.getDate();
             var suffix = day % 10 === 1 && day !== 11 ? "st" : day % 10 === 2 && day !== 12 ? "nd" : day % 10 === 3 && day !== 13 ? "rd" : "th";
@@ -1695,50 +1943,11 @@
             return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":" + (d.getMinutes() < 10 ? "0" : "") + d.getMinutes();
           }
 
-          function neighborHasDate(label) {
-            var rows = {};
-            var y;
-
-            cellMap.forEach(function (value, key) {
-              var comma = key.indexOf(",");
-              var wx = parseInt(key, 10);
-              var wy = parseInt(key.slice(comma + 1), 10);
-
-              if (Math.abs(wy - cursorY) <= 3 && wx >= cursorX - 30 && wx <= cursorX + 60) {
-                (rows[wy] = rows[wy] || []).push([wx, value]);
-              }
-            });
-
-            for (y in rows) {
-              var line = "";
-              var last = null;
-
-              rows[y].sort(function (p, q) { return p[0] - q[0]; }).forEach(function (c) {
-                line += (last !== null && c[0] > last + 1 ? " " : "") + c[1];
-                last = c[0];
-              });
-
-              if (line.indexOf(label + " ") !== -1) {
-                return true;
-              }
-            }
-
-            return false;
-          }
-
           function insertTextAtCursor(text) {
             var idx;
 
             if (!cursorActive) {
               return;
-            }
-
-            if (needStamp) {
-              needStamp = false;
-
-              if (!neighborHasDate(dateLabel(new Date()))) {
-                insertTextAtCursor(dateLabel(new Date()) + " " + timeLabel(new Date()) + " ");
-              }
             }
 
             var chars = Array.from(text);
@@ -1865,7 +2074,6 @@
               cursorX = hit.worldX;
               cursorY = hit.worldY;
               cursorActive = true;
-              needStamp = true;
               hidePicker();
               canvas.focus();
               mobileInput.focus();
@@ -2112,7 +2320,7 @@
               ctx.fillRect(g.x0 * cellWidth - offsetX - 5, r.y0 * cellHeight - offsetY, 2, (r.y1 - r.y0 + 1) * cellHeight);
             });
 
-            if (pomo.timer && rows[pomo.timer.y]) {
+            if (pomo.timer && (!pomo.timer.d || pomo.timer.d === currentDay) && rows[pomo.timer.y]) {
               var endX = 0;
               var left = Math.max(0, Math.round((pomo.timer.end - now) / 1000));
 
@@ -2176,7 +2384,11 @@
           mobileInput.style.pointerEvents = "none";
           mobileInput.style.zIndex = "-1";
 
+          dayNode = document.createElement("div");
+          dayNode.id = "guestbook-day";
+
           container.appendChild(toolbar);
+          container.appendChild(dayNode);
           container.appendChild(canvas);
           container.appendChild(mobileInput);
           document.body.appendChild(container);
@@ -2190,10 +2402,6 @@
           pomoRender();
 
           ctx = canvas.getContext("2d");
-
-          loadFromStorage();
-          loadImages();
-          loadShapes();
 
           window.addEventListener("paste", onPaste);
           window.addEventListener("keydown", function (e) {
@@ -2225,11 +2433,22 @@
             container: container,
             canvas: canvas,
             active: false,
-            start: function () {
+            start: function (day) {
               this.active = true;
               container.style.display = "block";
               resizeCanvas();
-              centerOnStartPoint();
+
+              if (day !== currentDay) {
+                loadDay(day);
+              } else {
+                centerOnStartPoint();
+              }
+
+              if (pendingJump) {
+                jumpTo(pendingJump.x, pendingJump.y);
+                pendingJump = null;
+              }
+
               canvas.focus();
               mobileInput.focus();
               updateCellCount();
@@ -2274,6 +2493,7 @@
                 syncRemote(true);
               }
             },
+            deleteDay: deleteDay,
             getMapSize: function () {
               return cellMap.size;
             },
@@ -2356,9 +2576,11 @@
           var hash = window.location.hash || "";
           var prefix = "#folder=";
 
-          if (hash === guestbookHash) {
+          var dayMatch = /^#guestbook_app(?:=(\d{4}-\d\d-\d\d))?$/.exec(hash);
+
+          if (dayMatch) {
             rootPre.style.display = "none";
-            createGuestbookApp().start();
+            createGuestbookApp().start(dayMatch[1] || todayKey());
             document.title = "free text editor";
             return;
           }
@@ -2379,10 +2601,28 @@
             }
           }
 
-          rootPre.innerHTML = rootTreeHtml;
+          rootPre.innerHTML = buildHomeHtml();
           document.title = "pranav ajay";
         }
 
+        if (rootPre) {
+          rootPre.addEventListener("click", function (event) {
+            var day = event.target && event.target.getAttribute && event.target.getAttribute("data-delete");
+
+            if (!day) {
+              return;
+            }
+
+            event.preventDefault();
+
+            if (window.confirm("delete " + formatDay(day) + " and everything on it? this can't be undone.")) {
+              createGuestbookApp().deleteDay(day);
+              rootPre.innerHTML = buildHomeHtml();
+            }
+          });
+        }
+
+        migrateLegacy();
         window.addEventListener("hashchange", renderFromHash);
         renderFromHash();
       })();
